@@ -29,30 +29,24 @@ jobs:
       - name: Apply UDP ASSOCIATE ATYP fix (patch V2/V3)
         run: |
           python3 - <<'EOF'
-          import re
           path = "sing-patched/protocol/socks/client.go"
           with open(path) as f:
               src = f.read()
 
-          # add net/netip import if missing
           if '"net/netip"' not in src:
-              src = src.replace(
-                  'import (\n',
-                  'import (\n\t"net/netip"\n',
-                  1
-              )
+              src = src.replace('import (\n', 'import (\n\t"net/netip"\n', 1)
+          if '"os"' not in src:
+              src = src.replace('import (\n', 'import (\n\t"os"\n', 1)
 
-          marker = "// SINGBOX-UDP-PATCH"
           patch = (
-              f'\n\t{marker}\n'
-              '\tif !address.IsValid() || (address.IsIPv6() && address.Addr.IsUnspecified()) {\n'
+              '\n\tif !address.IsValid() || (address.IsIPv6() && address.Addr.IsUnspecified()) {\n'
+              '\t\tos.Stderr.WriteString("SINGBOX-UDP-PATCH-ACTIVE\\n")\n'
               '\t\taddress = M.SocksaddrFrom(netip.IPv4Unspecified(), address.Port)\n'
               '\t}\n'
           )
 
           anchor = "command = socks5.CommandUDPAssociate"
           idx = src.index(anchor) + len(anchor)
-          # insert right after the anchor line ends
           nl = src.index("\n", idx) + 1
           src = src[:nl] + patch + src[nl:]
 
@@ -60,7 +54,7 @@ jobs:
               f.write(src)
           print("patched OK")
           EOF
-          grep -n "SINGBOX-UDP-PATCH" sing-patched/protocol/socks/client.go
+          grep -n "SINGBOX-UDP-PATCH-ACTIVE" sing-patched/protocol/socks/client.go
 
       - name: Wire in replace directive
         working-directory: sing-box
@@ -83,7 +77,7 @@ jobs:
       - name: Verify patch marker made it into the binary
         working-directory: sing-box
         run: |
-          strings sing-box-arm64 | grep SINGBOX-UDP-PATCH && echo "PATCH CONFIRMED IN BINARY" || (echo "PATCH MISSING" && exit 1)
+          strings sing-box-arm64 | grep SINGBOX-UDP-PATCH-ACTIVE && echo "PATCH CONFIRMED IN BINARY" || (echo "PATCH MISSING" && exit 1)
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
