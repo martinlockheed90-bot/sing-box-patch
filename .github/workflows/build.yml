@@ -1,86 +1,71 @@
-name: sing-box-standalone-patched
-
-on:
-  workflow_dispatch:
-
-jobs:
-  build:
-    runs-on: ubuntu-latest
-    steps:
-      - name: Set up Go
-        uses: actions/setup-go@v5
-        with:
-          go-version: '1.23'
-
-      - name: Checkout sing-box v1.13.14
-        uses: actions/checkout@v4
-        with:
-          repository: SagerNet/sing-box
-          ref: v1.13.14
-          path: sing-box
-
-      - name: Checkout sing v0.8.11 (dependency to patch)
-        uses: actions/checkout@v4
-        with:
-          repository: SagerNet/sing
-          ref: v0.8.11
-          path: sing-patched
-
-      - name: Apply UDP ASSOCIATE ATYP fix (patch V2/V3)
+- name: Apply UDP ASSOCIATE patches (ATYP fix + lenient UDP relay)
         run: |
           python3 - <<'EOF'
           path = "sing-patched/protocol/socks/client.go"
           with open(path) as f:
               src = f.read()
 
+          # --- patch 1: ATYP fix (unchanged from before) ---
           if '"net/netip"' not in src:
               src = src.replace('import (\n', 'import (\n\t"net/netip"\n', 1)
-          if '"os"' not in src:
-              src = src.replace('import (\n', 'import (\n\t"os"\n', 1)
 
-          patch = (
+          patch1 = (
               '\n\tif !address.IsValid() || (address.IsIPv6() && address.Addr.IsUnspecified()) {\n'
               '\t\tos.Stderr.WriteString("SINGBOX-UDP-PATCH-ACTIVE\\n")\n'
               '\t\taddress = M.SocksaddrFrom(netip.IPv4Unspecified(), address.Port)\n'
               '\t}\n'
           )
+          anchor1 = "command = socks5.CommandUDPAssociate"
+          idx1 = src.index(anchor1) + len(anchor1)
+          nl1 = src.index("\n", idx1) + 1
+          src = src[:nl1] + patch1 + src[nl1:]
 
-          anchor = "command = socks5.CommandUDPAssociate"
-          idx = src.index(anchor) + len(anchor)
-          nl = src.index("\n", idx) + 1
-          src = src[:nl] + patch + src[nl:]
+          # --- patch 2: lenient UDP relay (new) ---
+          old2 = (
+              '\t\tudpConn, err := c.dialer.DialContext(ctx, N.NetworkUDP, response.Bind)\n'
+              '\t\tif err != nil {\n'
+              '\t\t\ttcpConn.Close()\n'
+              '\t\t\treturn nil, err\n'
+              '\t\t}\n'
+              '\t\treturn NewAssociatePacketConn(udpConn, address, tcpConn), nil\n'
+          )
+          new2 = (
+              '\t\tpacketConn, err := c.dialer.ListenPacket(ctx, response.Bind)\n'
+              '\t\tif err != nil {\n'
+              '\t\t\ttcpConn.Close()\n'
+              '\t\t\treturn nil, err\n'
+              '\t\t}\n'
+              '\t\tudpConn := &looseUDPConn{PacketConn: packetConn, remote: response.Bind.UDPAddr()}\n'
+              '\t\treturn NewAssociatePacketConn(udpConn, address, tcpConn), nil\n'
+          )
+          assert old2 in src, "patch2 anchor not found"
+          src = src.replace(old2, new2, 1)
+
+          wrapper = (
+              "\n"
+              "// looseUDPConn adapts an unconnected net.PacketConn to net.Conn.\n"
+              "type looseUDPConn struct {\n"
+              "\tnet.PacketConn\n"
+              "\tremote net.Addr\n"
+              "}\n\n"
+              "func (c *looseUDPConn) Read(b []byte) (n int, err error) {\n"
+              "\tn, _, err = c.PacketConn.ReadFrom(b)\n"
+              "\treturn\n"
+              "}\n\n"
+              "func (c *looseUDPConn) Write(b []byte) (n int, err error) {\n"
+              "\treturn c.PacketConn.WriteTo(b, c.remote)\n"
+              "}\n\n"
+              "func (c *looseUDPConn) RemoteAddr() net.Addr {\n"
+              "\treturn c.remote\n"
+              "}\n\n"
+          )
+          anchor2 = "func (c *Client) ListenPacket(ctx context.Context, destination M.Socksaddr) (net.PacketConn, error) {"
+          idx2 = src.index(anchor2)
+          src = src[:idx2] + wrapper + src[idx2:]
 
           with open(path, "w") as f:
               f.write(src)
           print("patched OK")
           EOF
           grep -n "SINGBOX-UDP-PATCH-ACTIVE" sing-patched/protocol/socks/client.go
-
-      - name: Wire in replace directive
-        working-directory: sing-box
-        run: |
-          echo 'replace github.com/sagernet/sing => ../sing-patched' >> go.mod
-          go mod tidy
-          grep "sagernet/sing =>" go.mod
-
-      - name: Cross-compile linux/arm64
-        working-directory: sing-box
-        env:
-          GOOS: linux
-          GOARCH: arm64
-          CGO_ENABLED: 0
-        run: |
-          go build -v -trimpath -tags "with_quic,with_utls,with_clash_api" \
-            -ldflags "-s -w" \
-            -o sing-box-arm64 ./cmd/sing-box
-
-      - name: Verify patch marker made it into the binary
-        working-directory: sing-box
-        run: |
-          strings sing-box-arm64 | grep SINGBOX-UDP-PATCH-ACTIVE && echo "PATCH CONFIRMED IN BINARY" || (echo "PATCH MISSING" && exit 1)
-
-      - name: Upload artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: sing-box-arm64-patched
-          path: sing-box/sing-box-arm64
+          grep -n "looseUDPConn" sing-patched/protocol/socks/client.go
